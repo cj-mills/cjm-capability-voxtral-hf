@@ -37,6 +37,7 @@ from cjm_transcription_plugin_system.plugin_interface import TranscriptionPlugin
 from cjm_transcription_plugin_system.core import AudioData, TranscriptionResult
 from cjm_transcription_plugin_system.storage import TranscriptionStorage
 from cjm_plugin_system.utils.hashing import hash_file, hash_bytes
+from cjm_plugin_system.core.interface import RELOAD_TRIGGER
 from cjm_plugin_system.core.errors import (
     PluginInputError, PluginFatalError, PluginResourceError, ResourceShortfall,
 )
@@ -56,6 +57,7 @@ class VoxtralHFPluginConfig:
         default="mistralai/Voxtral-Mini-3B-2507",
         metadata={
             SCHEMA_TITLE: "Model ID",
+            RELOAD_TRIGGER: "model",  # CR-4: change triggers model reload
             SCHEMA_DESC: "Voxtral model to use. Mini is faster, Small is more accurate.",
             SCHEMA_ENUM: ["mistralai/Voxtral-Mini-3B-2507", "mistralai/Voxtral-Small-24B-2507"]
         }
@@ -64,6 +66,7 @@ class VoxtralHFPluginConfig:
         default="auto",
         metadata={
             SCHEMA_TITLE: "Device",
+            RELOAD_TRIGGER: "model",  # CR-4: change triggers model reload
             SCHEMA_DESC: "Device for inference (auto will use CUDA if available)",
             SCHEMA_ENUM: ["auto", "cpu", "cuda"]
         }
@@ -72,6 +75,7 @@ class VoxtralHFPluginConfig:
         default="auto",
         metadata={
             SCHEMA_TITLE: "Data Type",
+            RELOAD_TRIGGER: "model",  # CR-4: change triggers model reload
             SCHEMA_DESC: "Data type for model weights (auto will use bfloat16 on GPU, float32 on CPU)",
             SCHEMA_ENUM: ["auto", "bfloat16", "float16", "float32"]
         }
@@ -149,6 +153,7 @@ class VoxtralHFPluginConfig:
         default=False,
         metadata={
             SCHEMA_TITLE: "Load in 8-bit",
+            RELOAD_TRIGGER: "model",  # CR-4: change triggers model reload
             SCHEMA_DESC: "Load model in 8-bit quantization (requires bitsandbytes)"
         }
     )
@@ -156,6 +161,7 @@ class VoxtralHFPluginConfig:
         default=False,
         metadata={
             SCHEMA_TITLE: "Load in 4-bit",
+            RELOAD_TRIGGER: "model",  # CR-4: change triggers model reload
             SCHEMA_DESC: "Load model in 4-bit quantization (requires bitsandbytes)"
         }
     )
@@ -219,23 +225,23 @@ class VoxtralHFPlugin(TranscriptionPlugin):
             # If the model changed, unload old model
             if self.config.model_id != new_config.model_id:
                 self.logger.info(f"Config change: Model {self.config.model_id} -> {new_config.model_id}")
-                self._unload_model()
+                self._release_model()
             
             # If device changed, unload
             if self.config.device != new_config.device:
                 self.logger.info(f"Config change: Device {self.config.device} -> {new_config.device}")
-                self._unload_model()
+                self._release_model()
             
             # If dtype changed, unload
             if self.config.dtype != new_config.dtype:
                 self.logger.info(f"Config change: Dtype {self.config.dtype} -> {new_config.dtype}")
-                self._unload_model()
+                self._release_model()
             
             # If quantization settings changed, unload
             if (self.config.load_in_8bit != new_config.load_in_8bit or
                 self.config.load_in_4bit != new_config.load_in_4bit):
                 self.logger.info("Config change: Quantization settings changed")
-                self._unload_model()
+                self._release_model()
         
         # Apply new config
         self.config = new_config
@@ -266,7 +272,7 @@ class VoxtralHFPlugin(TranscriptionPlugin):
         
         self.logger.info(f"Initialized Voxtral HF plugin with model '{self.config.model_id}' on device '{self.device}' with dtype '{self.dtype}'")
     
-    def _unload_model(self) -> None:
+    def _release_model(self) -> None:
         """Unload the current model and free resources."""
         if self.model is None and self.processor is None:
             return
