@@ -37,6 +37,9 @@ from cjm_transcription_plugin_system.plugin_interface import TranscriptionPlugin
 from cjm_transcription_plugin_system.core import AudioData, TranscriptionResult
 from cjm_transcription_plugin_system.storage import TranscriptionStorage
 from cjm_plugin_system.utils.hashing import hash_file, hash_bytes
+from cjm_plugin_system.core.errors import (
+    PluginInputError, PluginFatalError, PluginResourceError, ResourceShortfall,
+)
 from cjm_plugin_system.utils.validation import (
     dict_to_config, config_to_dict, validate_config, dataclass_to_jsonschema,
     SCHEMA_TITLE, SCHEMA_DESC, SCHEMA_MIN, SCHEMA_MAX, SCHEMA_ENUM
@@ -341,8 +344,22 @@ class VoxtralHFPlugin(TranscriptionPlugin):
                     self.logger.info("Model compiled with torch.compile")
                     
                 self.logger.info("Voxtral model loaded successfully")
+            except torch.cuda.OutOfMemoryError as e:
+                # SG-47 Track B: CUDA OOM during model load → PluginResourceError
+                # so CR-7's reactive-retry path (substrate-side) can evict + reload.
+                free_bytes = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
+                available_mb = free_bytes / (1024 ** 2)
+                raise PluginResourceError(
+                    f"CUDA OOM loading Voxtral model {self.config.model_name!r}: {e}",
+                    resource_shortfall=ResourceShortfall(
+                        resource='gpu_vram_mb',
+                        needed=available_mb + 100.0,
+                        available=available_mb,
+                    ),
+                ) from e
             except Exception as e:
-                raise RuntimeError(f"Failed to load Voxtral model: {e}")
+                # SG-47: non-resource load failures — fatal; author/config attention needed.
+                raise PluginFatalError(f"Failed to load Voxtral model: {e}") from e
     
     def _prepare_audio(
         self,
@@ -375,7 +392,10 @@ class VoxtralHFPlugin(TranscriptionPlugin):
                 sf.write(tmp_file.name, audio_array, audio.sample_rate)
                 return tmp_file.name
         else:
-            raise ValueError(f"Unsupported audio input type: {type(audio)}")
+            raise PluginInputError(  # SG-47: typed input-validation (multi-inherits ValueError)
+                f"Unsupported audio input type: {type(audio)}",
+                fields_invalid=["audio"],
+            )
     
     def execute(
         self,
@@ -423,15 +443,27 @@ class VoxtralHFPlugin(TranscriptionPlugin):
                 generation_kwargs["temperature"] = temperature
                 generation_kwargs["top_p"] = top_p
             
-            # Generate transcription
-            with torch.no_grad():
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    
-                    outputs = self.model.generate(
-                        **inputs,
-                        **generation_kwargs
-                    )
+            # Generate transcription. SG-47 Track B wraps the inference site so
+            # CUDA OOM surfaces as PluginResourceError → CR-7 reactive-retry reloads.
+            try:
+                with torch.no_grad():
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        outputs = self.model.generate(
+                            **inputs,
+                            **generation_kwargs
+                        )
+            except torch.cuda.OutOfMemoryError as e:
+                free_bytes = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
+                available_mb = free_bytes / (1024 ** 2)
+                raise PluginResourceError(
+                    f"CUDA OOM during Voxtral inference (model={self.config.model_name!r}): {e}",
+                    resource_shortfall=ResourceShortfall(
+                        resource='gpu_vram_mb',
+                        needed=available_mb + 100.0,
+                        available=available_mb,
+                    ),
+                ) from e
             
             # Decode the output
             result_text = self.processor.batch_decode(
