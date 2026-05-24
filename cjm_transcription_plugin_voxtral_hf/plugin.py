@@ -657,22 +657,62 @@ def execute_stream(
             generation_kwargs["temperature"] = temperature
             generation_kwargs["top_p"] = top_p
         
-        # Start generation in a separate thread with torch.no_grad()               
-        def generate_with_no_grad():                                               
-          with torch.no_grad():                                                  
-              self.model.generate(**generation_kwargs)                           
-        
-        thread = Thread(target=generate_with_no_grad)                              
-        thread.start() 
-        
-        # Collect generated text
+        # Start generation in a separate thread with torch.no_grad().
+        # SG-47 Track B follow-up: thread target wraps the generate() call so
+        # CUDA OOMs (and other exceptions) raised inside the thread propagate
+        # back to the generator caller as typed PluginResourceError. The mutable
+        # `generation_exception` list is the cross-thread propagation channel
+        # — single-element capture is sufficient because we only re-raise once.
+        generation_exception: List[BaseException] = []
+
+        def generate_with_no_grad():
+            try:
+                with torch.no_grad():
+                    self.model.generate(**generation_kwargs)
+            except BaseException as e:
+                # Capture for cross-thread propagation; re-raise so the thread
+                # still terminates normally and HuggingFace's TextIteratorStreamer
+                # gets its end-signal via the generate() finally block (the streamer
+                # signals StopIteration to the consuming for-loop on end).
+                generation_exception.append(e)
+                raise
+
+        thread = Thread(target=generate_with_no_grad)
+        thread.start()
+
+        # Collect generated text. If the thread crashes, HF's streamer signals
+        # end (StopIteration) when generate's finally fires; the for-loop
+        # terminates without yielding further chunks, and the post-iteration
+        # exception check below re-raises the captured exception.
         generated_text = ""
         for text_chunk in streamer:
             generated_text += text_chunk
             yield text_chunk
-        
-        # Wait for generation to complete
-        thread.join()
+
+        # Wait for generation to complete (bounded — generation should be done
+        # by the time the streamer's iteration ended; this is mostly to flush
+        # the captured exception state).
+        thread.join(timeout=30.0)
+
+        # SG-47 Track B follow-up: re-raise any thread-captured exception with
+        # typed classification. CUDA OOMs map to PluginResourceError + populated
+        # ResourceShortfall so CR-7's reactive-retry path can reload + retry.
+        if generation_exception:
+            exc = generation_exception[0]
+            if isinstance(exc, torch.cuda.OutOfMemoryError):
+                free_bytes = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
+                available_mb = free_bytes / (1024 ** 2)
+                raise PluginResourceError(
+                    f"CUDA OOM during Voxtral streaming inference (model={model_id!r}): {exc}",
+                    resource_shortfall=ResourceShortfall(
+                        resource='gpu_vram_mb',
+                        needed=available_mb + 100.0,
+                        available=available_mb,
+                    ),
+                ) from exc
+            # Non-OOM thread exception: re-raise as-is so the substrate's default
+            # classify_exception() MRO walk classifies it via CR-5.
+            raise exc
 
         # Clean up tensors immediately
         del inputs
