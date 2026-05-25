@@ -96,7 +96,7 @@ def supports_streaming(
 @patch
 def execute_stream(
     self:VoxtralHFPlugin,
-    audio: Union[AudioData, str, Path],  # Audio data or path to audio file
+    audio: Union[str, Path],  # Audio data or path to audio file
     **kwargs  # Additional plugin-specific parameters
 ) -> Generator[str, None, TranscriptionResult]:  # Yields text chunks, returns final result
     "Stream transcription results chunk by chunk."
@@ -193,7 +193,7 @@ class VoxtralHFPlugin:
     
     def execute(
             self,
-            audio: Union[AudioData, str, Path], # Audio data or path to audio file to transcribe
+            audio: Union[str, Path], # Audio data or path to audio file to transcribe
             **kwargs # Additional arguments to override config
         ) -> TranscriptionResult: # Transcription result with text and metadata
         "Transcribe audio using Voxtral."
