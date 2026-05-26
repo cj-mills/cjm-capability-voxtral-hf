@@ -212,47 +212,23 @@ class VoxtralHFPlugin(TranscriptionPlugin):
         """Return dataclass describing the plugin's configuration options."""
         return VoxtralHFPluginConfig
     
-    def initialize(
+    def _apply_config(
         self,
         config: Optional[Any] = None # Configuration dataclass, dict, or None
     ) -> None:
-        """Initialize or re-configure the plugin (idempotent)."""
-        # Parse new config
-        new_config = dict_to_config(VoxtralHFPluginConfig, config or {})
+        """CR-4: apply config + derive config-dependent state (device, dtype). No
+        heavy-resource work. Called by initialize (first-time) and the substrate's
+        reconfigure delta path. Model release on a model_id/device/dtype/quantization
+        change is handled declaratively via RELOAD_TRIGGER -> _release_model."""
+        self.config = dict_to_config(VoxtralHFPluginConfig, config or {})
         
-        # Check for changes if already running
-        if self.config:
-            # If the model changed, unload old model
-            if self.config.model_id != new_config.model_id:
-                self.logger.info(f"Config change: Model {self.config.model_id} -> {new_config.model_id}")
-                self._release_model()
-            
-            # If device changed, unload
-            if self.config.device != new_config.device:
-                self.logger.info(f"Config change: Device {self.config.device} -> {new_config.device}")
-                self._release_model()
-            
-            # If dtype changed, unload
-            if self.config.dtype != new_config.dtype:
-                self.logger.info(f"Config change: Dtype {self.config.dtype} -> {new_config.dtype}")
-                self._release_model()
-            
-            # If quantization settings changed, unload
-            if (self.config.load_in_8bit != new_config.load_in_8bit or
-                self.config.load_in_4bit != new_config.load_in_4bit):
-                self.logger.info("Config change: Quantization settings changed")
-                self._release_model()
-        
-        # Apply new config
-        self.config = new_config
-        
-        # Set device
+        # Resolve device
         if self.config.device == "auto":
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = self.config.device
         
-        # Set dtype
+        # Resolve dtype
         if self.config.dtype == "auto":
             if self.device == "cuda":
                 self.dtype = torch.bfloat16
@@ -265,8 +241,17 @@ class VoxtralHFPlugin(TranscriptionPlugin):
                 "float32": torch.float32
             }
             self.dtype = dtype_map[self.config.dtype]
+
+    def initialize(
+        self,
+        config: Optional[Any] = None # Configuration dataclass, dict, or None
+    ) -> None:
+        """First-time setup. CR-4: the manual model/device/dtype/quantization
+        diff-and-reload is replaced by declarative RELOAD_TRIGGER metadata; the
+        substrate's reconfigure path fires _release_model then re-applies config."""
+        self._apply_config(config)
         
-        # Initialize standardized storage
+        # Initialize standardized storage (one-time)
         db_path = get_plugin_metadata()["db_path"]
         self.storage = TranscriptionStorage(db_path)
         
@@ -515,6 +500,16 @@ class VoxtralHFPlugin(TranscriptionPlugin):
         """Check if Voxtral is available."""
         return VOXTRAL_AVAILABLE
     
+    def prefetch(self) -> None:
+        """CR-4 (SG-19): eagerly load the model + processor so the first execute()
+        doesn't pay the download/load cost. Idempotent via _load_model's None-guard."""
+        self._load_model()
+
+    def on_disable(self) -> None:
+        """CR-2: release the GPU model + processor when the operator disables the
+        plugin (the worker stays alive); lazy reload on the next execute."""
+        self._release_model()
+
     def cleanup(self) -> None:
         """Clean up resources with aggressive memory management."""
         if self.model is None and self.processor is None:
