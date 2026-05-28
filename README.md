@@ -21,8 +21,8 @@ Total: 2 notebooks
 
 ``` mermaid
 graph LR
-    meta[meta<br/>Metadata]
-    plugin[plugin<br/>Voxtral HF Plugin]
+    meta["meta<br/>Metadata"]
+    plugin["plugin<br/>Voxtral HF Plugin"]
 
     plugin --> meta
 ```
@@ -117,7 +117,6 @@ class VoxtralHFPluginConfig:
     do_sample: bool = field(...)
     temperature: float = field(...)
     top_p: float = field(...)
-    streaming: bool = field(...)
     trust_remote_code: bool = field(...)
     cache_dir: Optional[str] = field(...)
     compile_model: bool = field(...)
@@ -179,7 +178,7 @@ class VoxtralHFPlugin:
             """Return dataclass describing the plugin's configuration options."""
             return VoxtralHFPluginConfig
         
-        def initialize(
+        def _apply_config(
             self,
             config: Optional[Any] = None # Configuration dataclass, dict, or None
         ) -> None
@@ -189,7 +188,9 @@ class VoxtralHFPlugin:
             self,
             config: Optional[Any] = None # Configuration dataclass, dict, or None
         ) -> None
-        "Initialize or re-configure the plugin (idempotent)."
+        "First-time setup. CR-4: the manual model/device/dtype/quantization
+diff-and-reload is replaced by declarative RELOAD_TRIGGER metadata; the
+substrate's reconfigure path fires _release_model then re-applies config."
     
     def execute(
             self,
@@ -202,8 +203,26 @@ class VoxtralHFPlugin:
             """Check if Voxtral is available."""
             return VOXTRAL_AVAILABLE
         
-        def cleanup(self) -> None
+        def prefetch(self) -> None
         "Check if Voxtral is available."
+    
+    def prefetch(self) -> None:
+            """CR-4 (SG-19): eagerly load the model + processor so the first execute()
+            doesn't pay the download/load cost. Idempotent via _load_model's None-guard."""
+            self._load_model()
+    
+        def on_disable(self) -> None
+        "CR-4 (SG-19): eagerly load the model + processor so the first execute()
+doesn't pay the download/load cost. Idempotent via _load_model's None-guard."
+    
+    def on_disable(self) -> None:
+            """CR-2: release the GPU model + processor when the operator disables the
+            plugin (the worker stays alive); lazy reload on the next execute."""
+            self._release_model()
+    
+        def cleanup(self) -> None
+        "CR-2: release the GPU model + processor when the operator disables the
+plugin (the worker stays alive); lazy reload on the next execute."
     
     def cleanup(self) -> None:
             """Clean up resources with aggressive memory management."""

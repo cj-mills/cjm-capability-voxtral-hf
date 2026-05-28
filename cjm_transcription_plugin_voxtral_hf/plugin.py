@@ -22,9 +22,7 @@ from threading import Thread
 
 from fastcore.basics import patch
 
-import numpy as np
 import torch
-import soundfile as sf
 
 try:
     from transformers import VoxtralForConditionalGeneration, AutoProcessor
@@ -119,13 +117,6 @@ class VoxtralHFPluginConfig:
             SCHEMA_DESC: "Top-p (nucleus) sampling parameter (only used when do_sample=true)",
             SCHEMA_MIN: 0.0,
             SCHEMA_MAX: 1.0
-        }
-    )
-    streaming:bool = field(
-        default=False,
-        metadata={
-            SCHEMA_TITLE: "Streaming",
-            SCHEMA_DESC: "Enable streaming output (yields partial results as they're generated)"
         }
     )
     trust_remote_code:bool = field(
@@ -341,7 +332,7 @@ class VoxtralHFPlugin(TranscriptionPlugin):
                 free_bytes = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
                 available_mb = free_bytes / (1024 ** 2)
                 raise PluginResourceError(
-                    f"CUDA OOM loading Voxtral model {self.config.model_name!r}: {e}",
+                    f"CUDA OOM loading Voxtral model {self.config.model_id!r}: {e}",
                     resource_shortfall=ResourceShortfall(
                         resource='gpu_vram_mb',
                         needed=available_mb + 100.0,
@@ -427,7 +418,7 @@ class VoxtralHFPlugin(TranscriptionPlugin):
                 free_bytes = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
                 available_mb = free_bytes / (1024 ** 2)
                 raise PluginResourceError(
-                    f"CUDA OOM during Voxtral inference (model={self.config.model_name!r}): {e}",
+                    f"CUDA OOM during Voxtral inference (model={self.config.model_id!r}): {e}",
                     resource_shortfall=ResourceShortfall(
                         resource='gpu_vram_mb',
                         needed=available_mb + 100.0,
