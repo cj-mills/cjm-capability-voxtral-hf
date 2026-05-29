@@ -60,7 +60,6 @@ def get_plugin_metadata() -> Dict[str, Any]: # Plugin metadata for manifest gene
     
     # Use CJM config if available, else fallback to env-relative paths
     cjm_data_dir = os.environ.get("CJM_DATA_DIR")
-    cjm_models_dir = os.environ.get("CJM_MODELS_DIR")
     
     # Plugin data directory
     plugin_name = "cjm-transcription-plugin-voxtral-hf"
@@ -86,6 +85,102 @@ from cjm_transcription_plugin_voxtral_hf.plugin import (
 
 ``` python
 @patch
+def _apply_config(
+    self:VoxtralHFPlugin,
+    config: Optional[Any] = None # Configuration dataclass, dict, or None
+) -> None
+    """
+    CR-4: apply config + derive config-dependent state (device, dtype). No
+    heavy-resource work. Called by initialize (first-time) and the substrate's
+    reconfigure delta path. Model release on a model_id/device/dtype/quantization
+    change is handled declaratively via RELOAD_TRIGGER -> _release_model.
+    """
+```
+
+``` python
+@patch
+def _release_model(self:VoxtralHFPlugin) -> None:
+    """Unload the current model + processor and free GPU memory.
+
+    Delegates to cjm-torch-plugin-utils' `release_model` (move-to-CPU / del / gc /
+    empty_cache / synchronize) -- the single source of truth across torch GPU plugins."""
+    if self.model is None and self.processor is None
+    """
+    Unload the current model + processor and free GPU memory.
+    
+    Delegates to cjm-torch-plugin-utils' `release_model` (move-to-CPU / del / gc /
+    empty_cache / synchronize) -- the single source of truth across torch GPU plugins.
+    """
+```
+
+``` python
+@patch
+def _load_model(self:VoxtralHFPlugin) -> None:
+    """Load the Voxtral model + processor (lazy).
+
+    The heartbeat wraps BOTH the (potentially long, often quiet) snapshot download
+    AND the silent from_pretrained build, so the substrate's prefetch stall detector
+    always sees the (progress, message) tuple advance. snapshot_download_with_progress
+    layers real per-file download % on top when the HF Hub tqdm callback fires.
+    CUDA OOM on load surfaces as a typed PluginResourceError for CR-7 reactive retry."""
+    if self.model is not None and self.processor is not None
+    """
+    Load the Voxtral model + processor (lazy).
+    
+    The heartbeat wraps BOTH the (potentially long, often quiet) snapshot download
+    AND the silent from_pretrained build, so the substrate's prefetch stall detector
+    always sees the (progress, message) tuple advance. snapshot_download_with_progress
+    layers real per-file download % on top when the HF Hub tqdm callback fires.
+    CUDA OOM on load surfaces as a typed PluginResourceError for CR-7 reactive retry.
+    """
+```
+
+``` python
+@patch
+def _prepare_audio(
+    self:VoxtralHFPlugin,
+    audio: Union[str, Path] # Path to a decodable audio file
+) -> str: # The audio file path
+    """
+    Validate the audio input and return it as a path string.
+    
+    The caller (orchestration / proxy) guarantees a model-ready audio file;
+    in-memory preparation is no longer a plugin responsibility.
+    """
+```
+
+``` python
+@patch
+def is_available(self:VoxtralHFPlugin) -> bool: # True if Voxtral and its dependencies are available
+    "Check if Voxtral is available."
+```
+
+``` python
+@patch
+def prefetch(self:VoxtralHFPlugin) -> None
+    """
+    CR-4 (SG-19): eagerly load the model + processor so the first execute()
+    doesn't pay the download/load cost. Idempotent via _load_model's None-guard.
+    """
+```
+
+``` python
+@patch
+def on_disable(self:VoxtralHFPlugin) -> None
+    """
+    CR-2: release the GPU model + processor when the operator disables the
+    plugin (the worker stays alive); lazy reload on the next execute.
+    """
+```
+
+``` python
+@patch
+def cleanup(self:VoxtralHFPlugin) -> None
+    "Release the model + processor (CR-4: delegates to `_release_model`)."
+```
+
+``` python
+@patch
 def supports_streaming(
     self:VoxtralHFPlugin
 ) -> bool:  # True if streaming is supported
@@ -106,7 +201,7 @@ def execute_stream(
 
 ``` python
 @dataclass
-class VoxtralHFPluginConfig:
+class VoxtralHFPluginConfig(HFCacheConfig):
     "Configuration for Voxtral HF transcription plugin."
     
     model_id: str = field(...)
@@ -117,8 +212,6 @@ class VoxtralHFPluginConfig:
     do_sample: bool = field(...)
     temperature: float = field(...)
     top_p: float = field(...)
-    trust_remote_code: bool = field(...)
-    cache_dir: Optional[str] = field(...)
     compile_model: bool = field(...)
     load_in_8bit: bool = field(...)
     load_in_4bit: bool = field(...)
@@ -141,15 +234,16 @@ class VoxtralHFPlugin:
     def name(self) -> str: # Plugin name identifier
             """Get the plugin name identifier."""
             return "voxtral_hf"
-        
+    
         @property
         def version(self) -> str: # Plugin version string
         "Get the plugin name identifier."
     
     def version(self) -> str: # Plugin version string
             """Get the plugin version string."""
-            return "1.0.0"
-        
+            from cjm_transcription_plugin_voxtral_hf import __version__
+            return __version__
+    
         @property
         def supported_formats(self) -> List[str]: # List of supported audio formats
         "Get the plugin version string."
@@ -177,8 +271,8 @@ class VoxtralHFPlugin:
     def get_config_dataclass() -> VoxtralHFPluginConfig: # Configuration dataclass
             """Return dataclass describing the plugin's configuration options."""
             return VoxtralHFPluginConfig
-        
-        def _apply_config(
+    
+        def initialize(
             self,
             config: Optional[Any] = None # Configuration dataclass, dict, or None
         ) -> None
@@ -198,34 +292,4 @@ substrate's reconfigure path fires _release_model then re-applies config."
             **kwargs # Additional arguments to override config
         ) -> TranscriptionResult: # Transcription result with text and metadata
         "Transcribe audio using Voxtral."
-    
-    def is_available(self) -> bool: # True if Voxtral and its dependencies are available
-            """Check if Voxtral is available."""
-            return VOXTRAL_AVAILABLE
-        
-        def prefetch(self) -> None
-        "Check if Voxtral is available."
-    
-    def prefetch(self) -> None:
-            """CR-4 (SG-19): eagerly load the model + processor so the first execute()
-            doesn't pay the download/load cost. Idempotent via _load_model's None-guard."""
-            self._load_model()
-    
-        def on_disable(self) -> None
-        "CR-4 (SG-19): eagerly load the model + processor so the first execute()
-doesn't pay the download/load cost. Idempotent via _load_model's None-guard."
-    
-    def on_disable(self) -> None:
-            """CR-2: release the GPU model + processor when the operator disables the
-            plugin (the worker stays alive); lazy reload on the next execute."""
-            self._release_model()
-    
-        def cleanup(self) -> None
-        "CR-2: release the GPU model + processor when the operator disables the
-plugin (the worker stays alive); lazy reload on the next execute."
-    
-    def cleanup(self) -> None:
-            """Clean up resources with aggressive memory management."""
-            if self.model is None and self.processor is None
-        "Clean up resources with aggressive memory management."
 ```

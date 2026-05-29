@@ -15,7 +15,7 @@ import logging
 from pathlib import Path
 from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
-from typing import Dict, Any, Optional, List, Union, Generator
+from typing import Dict, Any, Optional, List, Union, Generator, ClassVar
 import tempfile
 import warnings
 from threading import Thread
@@ -35,9 +35,9 @@ from cjm_transcription_plugin_system.plugin_interface import TranscriptionPlugin
 from cjm_transcription_plugin_system.core import TranscriptionResult
 from cjm_transcription_plugin_system.storage import TranscriptionStorage
 from cjm_plugin_system.utils.hashing import hash_file, hash_bytes
-from cjm_plugin_system.core.interface import RELOAD_TRIGGER
+from cjm_plugin_system.core.interface import RELOAD_TRIGGER, EnvVarSpec
 from cjm_plugin_system.core.errors import (
-    PluginInputError, PluginFatalError, PluginResourceError, ResourceShortfall,
+    PluginInputError, PluginFatalError, PluginResourceError,
 )
 from cjm_plugin_system.utils.validation import (
     dict_to_config, config_to_dict, validate_config, dataclass_to_jsonschema,
@@ -46,10 +46,15 @@ from cjm_plugin_system.utils.validation import (
 from cjm_transcription_plugin_voxtral_hf.meta import (
     get_plugin_metadata
 )
+from cjm_torch_plugin_utils.memory import release_model
+from cjm_torch_plugin_utils.oom import cuda_oom_to_plugin_resource_error
+from cjm_hf_plugin_utils.cache_config import HFCacheConfig
+from cjm_hf_plugin_utils.download import snapshot_download_with_progress
+from cjm_hf_plugin_utils.loading import load_pretrained_with_oom
 
-# %% ../nbs/plugin.ipynb #28e027a7-577a-41ac-8f13-bf84a68b5adb
+# %% ../nbs/plugin.ipynb #config-dataclass
 @dataclass
-class VoxtralHFPluginConfig:
+class VoxtralHFPluginConfig(HFCacheConfig):
     """Configuration for Voxtral HF transcription plugin."""
     model_id:str = field(
         default="mistralai/Voxtral-Mini-3B-2507",
@@ -119,20 +124,6 @@ class VoxtralHFPluginConfig:
             SCHEMA_MAX: 1.0
         }
     )
-    trust_remote_code:bool = field(
-        default=False,
-        metadata={
-            SCHEMA_TITLE: "Trust Remote Code",
-            SCHEMA_DESC: "Whether to trust remote code when loading the model"
-        }
-    )
-    cache_dir:Optional[str] = field(
-        default=None,
-        metadata={
-            SCHEMA_TITLE: "Cache Directory",
-            SCHEMA_DESC: "Directory to cache downloaded models"
-        }
-    )
     compile_model:bool = field(
         default=False,
         metadata={
@@ -158,11 +149,33 @@ class VoxtralHFPluginConfig:
     )
 
 
+# %% ../nbs/plugin.ipynb #plugin-class
 class VoxtralHFPlugin(TranscriptionPlugin):
     """Mistral Voxtral transcription plugin via Hugging Face Transformers."""
-    
+
     config_class = VoxtralHFPluginConfig
-    
+
+    WORKER_ENV: ClassVar[List[EnvVarSpec]] = [
+        EnvVarSpec(
+            name="CUDA_VISIBLE_DEVICES",
+            default="0",
+            label="GPU Device",
+            description="Which GPU index the worker uses.",
+        ),
+        EnvVarSpec(
+            name="OMP_NUM_THREADS",
+            default="4",
+            label="OpenMP Threads",
+            description="Thread cap for CPU-side ops.",
+        ),
+        EnvVarSpec(
+            name="HF_HOME",
+            default="${CJM_MODELS_DIR}/huggingface",
+            label="HF Cache Directory",
+            description="HuggingFace Hub cache root (templated to the substrate models dir).",
+        ),
+    ]
+
     def __init__(self):
         """Initialize the Voxtral HF plugin with default configuration."""
         self.logger = logging.getLogger(f"{__name__}.{type(self).__name__}")
@@ -172,17 +185,18 @@ class VoxtralHFPlugin(TranscriptionPlugin):
         self.device = None
         self.dtype = None
         self.storage: Optional[TranscriptionStorage] = None
-    
+
     @property
     def name(self) -> str: # Plugin name identifier
         """Get the plugin name identifier."""
         return "voxtral_hf"
-    
+
     @property
     def version(self) -> str: # Plugin version string
         """Get the plugin version string."""
-        return "1.0.0"
-    
+        from cjm_transcription_plugin_voxtral_hf import __version__
+        return __version__
+
     @property
     def supported_formats(self) -> List[str]: # List of supported audio formats
         """Get the list of supported audio file formats."""
@@ -202,36 +216,6 @@ class VoxtralHFPlugin(TranscriptionPlugin):
     def get_config_dataclass() -> VoxtralHFPluginConfig: # Configuration dataclass
         """Return dataclass describing the plugin's configuration options."""
         return VoxtralHFPluginConfig
-    
-    def _apply_config(
-        self,
-        config: Optional[Any] = None # Configuration dataclass, dict, or None
-    ) -> None:
-        """CR-4: apply config + derive config-dependent state (device, dtype). No
-        heavy-resource work. Called by initialize (first-time) and the substrate's
-        reconfigure delta path. Model release on a model_id/device/dtype/quantization
-        change is handled declaratively via RELOAD_TRIGGER -> _release_model."""
-        self.config = dict_to_config(VoxtralHFPluginConfig, config or {})
-        
-        # Resolve device
-        if self.config.device == "auto":
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            self.device = self.config.device
-        
-        # Resolve dtype
-        if self.config.dtype == "auto":
-            if self.device == "cuda":
-                self.dtype = torch.bfloat16
-            else:
-                self.dtype = torch.float32
-        else:
-            dtype_map = {
-                "bfloat16": torch.bfloat16,
-                "float16": torch.float16,
-                "float32": torch.float32
-            }
-            self.dtype = dtype_map[self.config.dtype]
 
     def initialize(
         self,
@@ -247,116 +231,6 @@ class VoxtralHFPlugin(TranscriptionPlugin):
         self.storage = TranscriptionStorage(db_path)
         
         self.logger.info(f"Initialized Voxtral HF plugin with model '{self.config.model_id}' on device '{self.device}' with dtype '{self.dtype}'")
-    
-    def _release_model(self) -> None:
-        """Unload the current model and free resources."""
-        if self.model is None and self.processor is None:
-            return
-        
-        self.logger.info("Unloading Voxtral model for reconfiguration")
-        
-        try:
-            # Move model to CPU first if it's on GPU
-            if self.model is not None and self.device == "cuda":
-                try:
-                    self.model = self.model.to('cpu')
-                except Exception as e:
-                    self.logger.warning(f"Could not move model to CPU: {e}")
-            
-            # Delete processor and model
-            if self.processor is not None:
-                del self.processor
-                self.processor = None
-            
-            if self.model is not None:
-                del self.model
-                self.model = None
-            
-            # Force garbage collection
-            import gc
-            gc.collect()
-            
-            # GPU-specific cleanup
-            if self.device == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                
-        except Exception as e:
-            self.logger.error(f"Error during model unload: {e}")
-            self.model = None
-            self.processor = None
-    
-    def _load_model(self) -> None:
-        """Load the Voxtral model and processor (lazy loading)."""
-        if self.model is None or self.processor is None:
-            try:
-                self.logger.info(f"Loading Voxtral model: {self.config.model_id}")
-                
-                # Load processor
-                self.processor = AutoProcessor.from_pretrained(
-                    self.config.model_id,
-                    cache_dir=self.config.cache_dir,
-                    trust_remote_code=self.config.trust_remote_code
-                )
-                
-                # Model loading kwargs
-                model_kwargs = {
-                    "cache_dir": self.config.cache_dir,
-                    "trust_remote_code": self.config.trust_remote_code,
-                    "device_map": self.device,
-                }
-                
-                # Add quantization settings if specified
-                if self.config.load_in_8bit:
-                    model_kwargs["load_in_8bit"] = True
-                elif self.config.load_in_4bit:
-                    model_kwargs["load_in_4bit"] = True
-                else:
-                    model_kwargs["dtype"] = self.dtype
-                
-                # Load model
-                self.model = VoxtralForConditionalGeneration.from_pretrained(
-                    self.config.model_id,
-                    **model_kwargs
-                )
-                
-                # Optionally compile the model (PyTorch 2.0+)
-                if self.config.compile_model and hasattr(torch, 'compile'):
-                    self.model = torch.compile(self.model)
-                    self.logger.info("Model compiled with torch.compile")
-                    
-                self.logger.info("Voxtral model loaded successfully")
-            except torch.cuda.OutOfMemoryError as e:
-                # SG-47 Track B: CUDA OOM during model load → PluginResourceError
-                # so CR-7's reactive-retry path (substrate-side) can evict + reload.
-                free_bytes = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
-                available_mb = free_bytes / (1024 ** 2)
-                raise PluginResourceError(
-                    f"CUDA OOM loading Voxtral model {self.config.model_id!r}: {e}",
-                    resource_shortfall=ResourceShortfall(
-                        resource='gpu_vram_mb',
-                        needed=available_mb + 100.0,
-                        available=available_mb,
-                    ),
-                ) from e
-            except Exception as e:
-                # SG-47: non-resource load failures — fatal; author/config attention needed.
-                raise PluginFatalError(f"Failed to load Voxtral model: {e}") from e
-    
-    def _prepare_audio(
-        self,
-        audio: Union[str, Path] # Path to a decodable audio file
-    ) -> str: # The audio file path
-        """Validate the audio input and return it as a path string.
-
-        The caller (orchestration / proxy) guarantees a model-ready audio file;
-        in-memory preparation is no longer a plugin responsibility."""
-        if isinstance(audio, (str, Path)):
-            return str(audio)
-        raise PluginInputError(  # SG-47: typed input-validation (multi-inherits ValueError)
-            f"Unsupported audio input type: {type(audio)}; expected a file path (str or Path)",
-            fields_invalid=["audio"],
-        )
 
     def execute(
         self,
@@ -415,15 +289,8 @@ class VoxtralHFPlugin(TranscriptionPlugin):
                             **generation_kwargs
                         )
             except torch.cuda.OutOfMemoryError as e:
-                free_bytes = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
-                available_mb = free_bytes / (1024 ** 2)
-                raise PluginResourceError(
-                    f"CUDA OOM during Voxtral inference (model={self.config.model_id!r}): {e}",
-                    resource_shortfall=ResourceShortfall(
-                        resource='gpu_vram_mb',
-                        needed=available_mb + 100.0,
-                        available=available_mb,
-                    ),
+                raise cuda_oom_to_plugin_resource_error(
+                    e, label=f"Voxtral inference (model={self.config.model_id!r})",
                 ) from e
             
             # Decode the output
@@ -487,76 +354,172 @@ class VoxtralHFPlugin(TranscriptionPlugin):
                 except Exception:
                     pass
 
-    def is_available(self) -> bool: # True if Voxtral and its dependencies are available
-        """Check if Voxtral is available."""
-        return VOXTRAL_AVAILABLE
-    
-    def prefetch(self) -> None:
-        """CR-4 (SG-19): eagerly load the model + processor so the first execute()
-        doesn't pay the download/load cost. Idempotent via _load_model's None-guard."""
-        self._load_model()
 
-    def on_disable(self) -> None:
-        """CR-2: release the GPU model + processor when the operator disables the
-        plugin (the worker stays alive); lazy reload on the next execute."""
-        self._release_model()
+# %% ../nbs/plugin.ipynb #m-apply-config
+@patch
+def _apply_config(
+    self:VoxtralHFPlugin,
+    config: Optional[Any] = None # Configuration dataclass, dict, or None
+) -> None:
+    """CR-4: apply config + derive config-dependent state (device, dtype). No
+    heavy-resource work. Called by initialize (first-time) and the substrate's
+    reconfigure delta path. Model release on a model_id/device/dtype/quantization
+    change is handled declaratively via RELOAD_TRIGGER -> _release_model."""
+    self.config = dict_to_config(VoxtralHFPluginConfig, config or {})
 
-    def cleanup(self) -> None:
-        """Clean up resources with aggressive memory management."""
-        if self.model is None and self.processor is None:
-            self.logger.info("No models to clean up")
-            return
-        
-        self.logger.info("Unloading Voxtral model")
-        
-        try:
-            # Move model to CPU first if it's on GPU (frees GPU memory immediately)
-            if self.model is not None and self.device == "cuda":
-                try:
-                    # Move to CPU to free GPU memory
-                    self.model = self.model.to('cpu')
-                    self.logger.debug("Model moved to CPU")
-                except Exception as e:
-                    self.logger.warning(f"Could not move model to CPU: {e}")
-            
-            # Delete processor first (it may hold references to model components)
-            if self.processor is not None:
-                del self.processor
-                self.processor = None
-                self.logger.debug("Processor deleted")
-            
-            # Delete model
-            if self.model is not None:
-                del self.model
-                self.model = None
-                self.logger.debug("Model deleted")
-            
-            # Force garbage collection BEFORE GPU operations
-            import gc
-            gc.collect()
-            
-            # GPU-specific cleanup
-            if self.device == "cuda" and torch.cuda.is_available():
-                # Empty cache and synchronize
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                
-                # Optional: more aggressive cleanup
-                torch.cuda.ipc_collect()
-                
-                # Log memory stats
-                if torch.cuda.is_available():
-                    allocated = torch.cuda.memory_allocated() / 1024**3
-                    reserved = torch.cuda.memory_reserved() / 1024**3
-                    self.logger.info(f"GPU memory after cleanup - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
-            
-            self.logger.info("Cleanup completed successfully")
-            
-        except Exception as e:
-            self.logger.error(f"Error during cleanup: {e}")
-            # Ensure references are cleared even if cleanup fails
-            self.model = None
-            self.processor = None
+    # Resolve device
+    if self.config.device == "auto":
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        self.device = self.config.device
+
+    # Resolve dtype
+    if self.config.dtype == "auto":
+        if self.device == "cuda":
+            self.dtype = torch.bfloat16
+        else:
+            self.dtype = torch.float32
+    else:
+        dtype_map = {
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32
+        }
+        self.dtype = dtype_map[self.config.dtype]
+
+
+# %% ../nbs/plugin.ipynb #m-release-model
+@patch
+def _release_model(self:VoxtralHFPlugin) -> None:
+    """Unload the current model + processor and free GPU memory.
+
+    Delegates to cjm-torch-plugin-utils' `release_model` (move-to-CPU / del / gc /
+    empty_cache / synchronize) -- the single source of truth across torch GPU plugins."""
+    if self.model is None and self.processor is None:
+        return
+    self.logger.info("Unloading Voxtral model for reconfiguration")
+    release_model(self, ["model", "processor"], self.device or "cuda", logger=self.logger)
+
+
+# %% ../nbs/plugin.ipynb #m-load-model
+@patch
+def _load_model(self:VoxtralHFPlugin) -> None:
+    """Load the Voxtral model + processor (lazy).
+
+    The heartbeat wraps BOTH the (potentially long, often quiet) snapshot download
+    AND the silent from_pretrained build, so the substrate's prefetch stall detector
+    always sees the (progress, message) tuple advance. snapshot_download_with_progress
+    layers real per-file download % on top when the HF Hub tqdm callback fires.
+    CUDA OOM on load surfaces as a typed PluginResourceError for CR-7 reactive retry."""
+    if self.model is not None and self.processor is not None:
+        return
+    self.logger.info(f"Loading Voxtral model: {self.config.model_id}")
+
+    # Built before the heartbeat block (instant). The snapshot below guarantees the
+    # cache is populated, so the loads run local-only.
+    model_kwargs = {
+        "cache_dir": self.config.cache_dir,
+        "revision": self.config.revision,
+        "trust_remote_code": self.config.trust_remote_code,
+        "local_files_only": True,
+        "device_map": self.device,
+    }
+    if self.config.load_in_8bit:
+        from transformers import BitsAndBytesConfig
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+    elif self.config.load_in_4bit:
+        from transformers import BitsAndBytesConfig
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
+    else:
+        model_kwargs["dtype"] = self.dtype
+
+    try:
+        with self.heartbeat(f"loading Voxtral model {self.config.model_id}"):
+            # Download (honors air-gap via local_files_only). The heartbeat is the
+            # floor here; the tqdm hook adds real "downloading <file>" % when it fires.
+            snapshot_download_with_progress(
+                self.config.model_id,
+                report_progress=self.report_progress,
+                cache_dir=self.config.cache_dir,
+                revision=self.config.revision,
+                local_files_only=self.config.local_files_only,
+            )
+            self.processor = AutoProcessor.from_pretrained(
+                self.config.model_id,
+                cache_dir=self.config.cache_dir,
+                revision=self.config.revision,
+                trust_remote_code=self.config.trust_remote_code,
+                local_files_only=True,
+            )
+            self.model = load_pretrained_with_oom(
+                VoxtralForConditionalGeneration,
+                self.config.model_id,
+                label=f"loading Voxtral model {self.config.model_id!r}",
+                **model_kwargs,
+            )
+
+        if self.config.compile_model and hasattr(torch, "compile"):
+            self.model = torch.compile(self.model)
+            self.logger.info("Model compiled with torch.compile")
+        self.logger.info("Voxtral model loaded successfully")
+    except PluginResourceError:
+        raise  # already typed by load_pretrained_with_oom
+    except torch.cuda.OutOfMemoryError as e:
+        # Defensive: OOM outside the wrapped model load (processor / compile).
+        raise cuda_oom_to_plugin_resource_error(
+            e, label=f"loading Voxtral model {self.config.model_id!r}",
+        ) from e
+    except Exception as e:
+        raise PluginFatalError(f"Failed to load Voxtral model: {e}") from e
+
+
+# %% ../nbs/plugin.ipynb #m-prepare-audio
+@patch
+def _prepare_audio(
+    self:VoxtralHFPlugin,
+    audio: Union[str, Path] # Path to a decodable audio file
+) -> str: # The audio file path
+    """Validate the audio input and return it as a path string.
+
+    The caller (orchestration / proxy) guarantees a model-ready audio file;
+    in-memory preparation is no longer a plugin responsibility."""
+    if isinstance(audio, (str, Path)):
+        return str(audio)
+    raise PluginInputError(  # SG-47: typed input-validation (multi-inherits ValueError)
+        f"Unsupported audio input type: {type(audio)}; expected a file path (str or Path)",
+        fields_invalid=["audio"],
+    )
+
+
+# %% ../nbs/plugin.ipynb #m-is-available
+@patch
+def is_available(self:VoxtralHFPlugin) -> bool: # True if Voxtral and its dependencies are available
+    """Check if Voxtral is available."""
+    return VOXTRAL_AVAILABLE
+
+
+# %% ../nbs/plugin.ipynb #m-prefetch
+@patch
+def prefetch(self:VoxtralHFPlugin) -> None:
+    """CR-4 (SG-19): eagerly load the model + processor so the first execute()
+    doesn't pay the download/load cost. Idempotent via _load_model's None-guard."""
+    self._load_model()
+
+
+# %% ../nbs/plugin.ipynb #m-on-disable
+@patch
+def on_disable(self:VoxtralHFPlugin) -> None:
+    """CR-2: release the GPU model + processor when the operator disables the
+    plugin (the worker stays alive); lazy reload on the next execute."""
+    self._release_model()
+
+
+# %% ../nbs/plugin.ipynb #m-cleanup
+@patch
+def cleanup(self:VoxtralHFPlugin) -> None:
+    """Release the model + processor (CR-4: delegates to `_release_model`)."""
+    self._release_model()
+
 
 # %% ../nbs/plugin.ipynb #4f195e29
 @patch
@@ -663,15 +626,8 @@ def execute_stream(
         if generation_exception:
             exc = generation_exception[0]
             if isinstance(exc, torch.cuda.OutOfMemoryError):
-                free_bytes = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
-                available_mb = free_bytes / (1024 ** 2)
-                raise PluginResourceError(
-                    f"CUDA OOM during Voxtral streaming inference (model={model_id!r}): {exc}",
-                    resource_shortfall=ResourceShortfall(
-                        resource='gpu_vram_mb',
-                        needed=available_mb + 100.0,
-                        available=available_mb,
-                    ),
+                raise cuda_oom_to_plugin_resource_error(
+                    exc, label=f"Voxtral streaming inference (model={model_id!r})",
                 ) from exc
             # Non-OOM thread exception: re-raise as-is so the substrate's default
             # classify_exception() MRO walk classifies it via CR-5.

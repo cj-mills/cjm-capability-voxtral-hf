@@ -21,7 +21,6 @@ def get_plugin_metadata() -> Dict[str, Any]: # Plugin metadata for manifest gene
     
     # Use CJM config if available, else fallback to env-relative paths
     cjm_data_dir = os.environ.get("CJM_DATA_DIR")
-    cjm_models_dir = os.environ.get("CJM_MODELS_DIR")
     
     # Plugin data directory
     plugin_name = "cjm-transcription-plugin-voxtral-hf"
@@ -35,15 +34,12 @@ def get_plugin_metadata() -> Dict[str, Any]: # Plugin metadata for manifest gene
     # Ensure data directory exists
     os.makedirs(data_dir, exist_ok=True)
     
-    # HuggingFace cache: use models_dir if configured
-    if cjm_models_dir:
-        hf_home = os.path.join(cjm_models_dir, "huggingface")
-    else:
-        hf_home = os.path.join(base_path, ".cache", "huggingface")
+
 
     return {
         "name": plugin_name,
         "version": __version__,
+        "description": "Mistral Voxtral speech-to-text transcription via HuggingFace Transformers.",
         "type": "transcription",
         "category": "transcription",
         "interface": "cjm_transcription_plugin_system.plugin_interface.TranscriptionPlugin",
@@ -56,17 +52,9 @@ def get_plugin_metadata() -> Dict[str, Any]: # Plugin metadata for manifest gene
         
         "db_path": db_path,
         
-        # Voxtral Mini (3B) needs ~6GB VRAM, Small (24B) needs ~48GB
         "resources": {
             "requires_gpu": True,
-            "min_gpu_vram_mb": 6144,      # ~6GB for Mini model
-            "recommended_gpu_vram_mb": 8192,
-            "min_system_ram_mb": 16384
         },
         
-        "env_vars": {
-            "CUDA_VISIBLE_DEVICES": "0",
-            "OMP_NUM_THREADS": "4",
-            "HF_HOME": hf_home
-        }
+        "env_vars": {}
     }

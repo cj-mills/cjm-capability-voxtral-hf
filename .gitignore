@@ -153,6 +153,13 @@ checklink/cookies.txt
 
 
 # Custom
+
+# cjm project-local test runtime (Track 17 Layer A scaffold)
+/runtime/
+/.cjm/
+/models/
+/configs/
+
 /test_files/*
 /examples/vllm/*
 /examples/.ipynb_checkpoints/*
