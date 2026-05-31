@@ -34,7 +34,7 @@ except ImportError:
 from cjm_transcription_plugin_system.plugin_interface import TranscriptionPlugin
 from cjm_transcription_plugin_system.core import TranscriptionResult
 from cjm_transcription_plugin_system.storage import TranscriptionStorage
-from cjm_plugin_system.utils.hashing import hash_file, hash_bytes
+from cjm_plugin_system.utils.hashing import hash_file, hash_bytes, hash_dict_canonical
 from cjm_plugin_system.core.interface import RELOAD_TRIGGER, EnvVarSpec
 from cjm_plugin_system.core.errors import (
     PluginInputError, PluginFatalError, PluginResourceError,
@@ -238,18 +238,39 @@ class VoxtralHFPlugin(TranscriptionPlugin):
         **kwargs # Additional arguments to override config
     ) -> TranscriptionResult: # Transcription result with text and metadata
         """Transcribe audio using Voxtral."""
-        # Load model if not already loaded
-        self._load_model()
-        
         # Prepare audio file
         audio_path = self._prepare_audio(audio)
         temp_file_created = False  # caller provides a model-ready path; plugin never creates a temp file
-        
-        # Hash the audio file before transcription
+
+        # Hash the audio file (content) for the cache key
         audio_hash = hash_file(audio_path)
-        
+
+        # Hash the effective config for cache keying. CR-15: config_hash derives from
+        # self.config (the effective config); the per-call kwargs config-overrides below
+        # are NOT reflected here — that override path predates the substrate overhaul and
+        # is slated for removal (candidate CR-15 / project_execute_invocation_contract_gap).
+        config_hash = hash_dict_canonical(config_to_dict(self.config))
+
+        # 1. Cache check (content-correct: audio_path + audio_hash + config_hash), before
+        #    loading the model so a pure cache hit skips the model load entirely.
+        if not kwargs.get("force", False):
+            cached = self.storage.get_cached(str(audio), audio_hash, config_hash)
+            if cached:
+                self.logger.info(f"Using cached transcription for {audio}")
+                return TranscriptionResult(
+                    text=cached.text,
+                    confidence=None,
+                    segments=cached.segments,
+                    metadata=cached.metadata,
+                )
+
+        # 2. Cache miss — load the model and transcribe
+        self._load_model()
+
         try:
             # Get config values, allowing kwargs overrides
+            # CR-15: these per-call config-overrides bypass reconfigure/persistence/validation/
+            # config_hash and are slated for removal; provenance kwargs (job_id/source_*_time) stay.
             model_id = kwargs.get("model_id", self.config.model_id)
             language = kwargs.get("language", self.config.language)
             max_new_tokens = kwargs.get("max_new_tokens", self.config.max_new_tokens)
@@ -336,6 +357,7 @@ class VoxtralHFPlugin(TranscriptionPlugin):
                 job_id=job_id,
                 audio_path=str(audio),
                 audio_hash=audio_hash,
+                config_hash=config_hash,
                 text=transcription_result.text,
                 text_hash=text_hash,
                 segments=transcription_result.segments,
