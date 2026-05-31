@@ -24,6 +24,9 @@ dependencies:
     - cjm-plugin-system
     - cjm-transcription-plugin-system
 
+    # Shared hf helpers for plugins
+    - cjm_hf_plugin_utils>=0.0.2
+
     # Voxtral/Transformers dependencies
     - "transformers<5"
     - accelerate
