@@ -23,7 +23,7 @@ This script:
     HF_HOME default (`${CJM_MODELS_DIR}/huggingface`), and (c) requires_gpu.
   - Eagerly loads the model via prefetch() — exercises cjm-hf-plugin-utils'
     snapshot_download_with_progress + the substrate heartbeat + load_pretrained_with_oom.
-  - Runs a real transcription via submit_sequence(ffmpeg.convert -> voxtral.execute).
+  - Runs a real transcription via submit_composition(ffmpeg.convert -> voxtral.execute).
   - Reads empirical_resources.db and ASSERTS gpu_memory_mb_peak > 0 (subtree GPU
     attribution through the worker -> HF model).
 """
@@ -96,12 +96,13 @@ def assert_manifest_shape() -> None:
 
 
 def run_e2e() -> None:
-    """Live transcription via submit_sequence: ffmpeg convert (MP3->WAV) -> voxtral execute."""
+    """Live transcription via submit_composition: ffmpeg convert (MP3->WAV) -> voxtral execute."""
     import asyncio
 
     from cjm_plugin_system.core.manager import PluginManager
     from cjm_plugin_system.core.config import get_config
-    from cjm_plugin_system.core.queue import JobQueue, SequenceStep, JobStatus
+    from cjm_plugin_system.core.queue import JobQueue
+    from cjm_plugin_system.core.ports import Composition, CompositionNode, NodeState, OutputRef
 
     cfg = get_config()
     log.info(f"data_dir={cfg.data_dir}, manifests_dir={cfg.manifests_dir}")
@@ -132,46 +133,35 @@ def run_e2e() -> None:
     pm.get_plugin(voxtral_id).prefetch()
     log.info(f"prefetch() returned in {time.time() - t0:.1f}s")
 
-    # ffmpeg.convert writes to <ffmpeg_data_dir>/converted/<stem>.wav.
-    ffmpeg_data_dir = Path(next(m for m in pm.discovered if m.name == FFMPEG_NAME).manifest["db_path"]).parent
-    predicted_wav = ffmpeg_data_dir / "converted" / f"{TEST_AUDIO.stem}.wav"
-    log.info(f"ffmpeg will convert {TEST_AUDIO.name} -> {predicted_wav}")
-
-    async def run_sequence() -> Any:
+    # CR-16 (stage 3): the composition binds voxtral's `audio` to ffmpeg's
+    # ACTUAL hashed cache_dir_for_config output path at execution time via
+    # OutputRef — the predict-the-path pattern is retired.
+    async def run_composition() -> Any:
         queue = JobQueue(deps=pm, sysmon_plugin_name=SYSMON_NAME)
         await queue.start()
         try:
-            seq_id = await queue.submit_sequence(
-                steps=[
-                    SequenceStep(plugin_instance_id=ffmpeg_id, kwargs={
-                        "action": "convert", "input_path": str(TEST_AUDIO),
-                        "output_format": "wav", "sample_rate": 16000, "channels": 1,
-                    }),
-                    SequenceStep(plugin_instance_id=voxtral_id, kwargs={"audio": str(predicted_wav)}),
-                ],
-                fail_fast=True,
-            )
-            log.info(f"Submitted sequence {seq_id}: ffmpeg.convert -> voxtral.execute")
-            terminal = {JobStatus.completed, JobStatus.failed, JobStatus.cancelled}
-            while True:
-                seq = queue.get_sequence(seq_id)
-                if seq is None:
-                    raise RuntimeError(f"sequence {seq_id} disappeared")
-                if seq.status in terminal:
-                    break
-                await asyncio.sleep(0.5)
-            if seq.status != JobStatus.completed:
-                raise RuntimeError(f"Sequence {seq_id} status={seq.status}; results={seq.results}")
-            return seq.results[-1].result
+            comp_id = await queue.submit_composition(Composition(nodes=[
+                CompositionNode("convert", ffmpeg_id, {
+                    "action": "convert", "input_path": str(TEST_AUDIO),
+                    "output_format": "wav", "sample_rate": 16000, "channels": 1,
+                }),
+                CompositionNode("transcribe", voxtral_id,
+                                {"audio": OutputRef("convert", "output_path")}),
+            ]))
+            log.info(f"Submitted composition {comp_id}: ffmpeg.convert -> voxtral.execute")
+            run = await queue.wait_for_composition(comp_id)
+            if run.status != NodeState.completed:
+                raise RuntimeError(f"Composition {comp_id} status={run.status}; nodes={run.node_runs}")
+            return run.results_by_node()["transcribe"]
         finally:
             await queue.stop()
 
-    log.info(f"Submitting submit_sequence for {TEST_AUDIO}...")
+    log.info(f"Submitting composition for {TEST_AUDIO}...")
     t0 = time.time()
-    result = asyncio.run(run_sequence())
+    result = asyncio.run(run_composition())
     from cjm_transcription_plugin_system.core import TranscriptionResult  # noqa: F401 — registers the wire kind (typed decode)
     text = result.text  # typed TranscriptionResult (stage-2 wire layer)
-    log.info(f"Sequence completed in {time.time() - t0:.1f}s: text={text[:120]!r}")
+    log.info(f"Composition completed in {time.time() - t0:.1f}s: text={text[:120]!r}")
     assert text and text.strip(), f"Empty transcription; raw result={result!r}"
 
     # Empirical store should have recorded a non-zero GPU peak for the worker subtree.
