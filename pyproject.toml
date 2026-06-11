@@ -12,7 +12,7 @@ license = {text = "Apache-2.0"}
 authors = [{name = "Christian J. Mills", email = "9126128+cj-mills@users.noreply.github.com"}]
 keywords = ['nbdev', 'jupyter', 'notebook', 'python']
 classifiers = ["Natural Language :: English", "Intended Audience :: Developers", "Development Status :: 3 - Alpha", "Programming Language :: Python :: 3", "Programming Language :: Python :: 3 :: Only"]
-dependencies = ['fastcore', 'cjm_plugin_system>=0.0.41', 'cjm_transcription_plugin_system>=0.0.30', 'cjm_torch_plugin_utils>=0.0.5', 'cjm_hf_plugin_utils>=0.0.6', 'torch', 'numpy', 'soundfile', 'transformers<5', 'accelerate', 'librosa', 'mistral-common[audio]']
+dependencies = ['fastcore', 'cjm_plugin_system>=0.0.42', 'cjm_transcription_plugin_system>=0.0.31', 'cjm_torch_plugin_utils>=0.0.6', 'cjm_hf_plugin_utils>=0.0.7', 'torch', 'numpy', 'soundfile', 'transformers<5', 'accelerate', 'librosa', 'mistral-common[audio]']
 
 [project.urls]
 Repository = "https://github.com/cj-mills/cjm-transcription-plugin-voxtral-hf"
