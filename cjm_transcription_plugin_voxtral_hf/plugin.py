@@ -8,35 +8,27 @@ Docs: https://cj-mills.github.io/cjm-transcription-plugin-voxtral-hfplugin.html.
 __all__ = ['VoxtralHFPluginConfig', 'VoxtralHFPlugin']
 
 # %% ../nbs/plugin.ipynb #f2fbcf2b
-import os
-import sys
-from uuid import uuid4
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field
-from dataclasses import replace as dataclass_replace
-from typing import Dict, Any, Optional, List, Union, Generator, ClassVar
-import tempfile
+from typing import Dict, Any, Optional, List, Union, ClassVar
 import warnings
-from threading import Thread
-
-from fastcore.basics import patch
 
 import torch
+from fastcore.basics import patch
 
 try:
     from transformers import VoxtralForConditionalGeneration, AutoProcessor
-    from transformers import TextStreamer, TextIteratorStreamer
     VOXTRAL_AVAILABLE = True
 except ImportError:
     VOXTRAL_AVAILABLE = False
-    
-from cjm_transcription_plugin_system.plugin_interface import TranscriptionPlugin
-from cjm_transcription_plugin_system.core import TranscriptionResult
-from cjm_transcription_plugin_system.storage import TranscriptionStorage
-from cjm_plugin_system.utils.hashing import hash_file, hash_bytes, hash_dict_canonical
-from .meta import get_plugin_metadata
-from cjm_plugin_system.core.interface import RELOAD_TRIGGER, EnvVarSpec
+
+# Stage 8 (Option C / PILLAR 1c): the tool re-bases onto ToolCapability (pure
+# compute). The cache/persist bookends + the TranscriptionResult data noun moved
+# OUT — the generic adapter (cjm-transcription-adapter-interface) owns the cache,
+# and the result DTO lives in cjm-capability-primitives. No get_plugin_metadata.
+from cjm_plugin_system.core.capability import ToolCapability, RELOAD_TRIGGER, EnvVarSpec
+from cjm_capability_primitives.transcription import TranscriptionResult
 from cjm_plugin_system.core.errors import (
     PluginInputError, PluginFatalError, PluginResourceError,
 )
@@ -44,11 +36,12 @@ from cjm_plugin_system.utils.validation import (
     dict_to_config, config_to_dict, validate_config, dataclass_to_jsonschema,
     SCHEMA_TITLE, SCHEMA_DESC, SCHEMA_MIN, SCHEMA_MAX, SCHEMA_ENUM
 )
-from cjm_transcription_plugin_voxtral_hf.meta import (
-    get_plugin_metadata
-)
+
+# Shared torch helpers (cjm-torch-plugin-utils): release + CUDA-OOM typing.
 from cjm_torch_plugin_utils.memory import release_model
 from cjm_torch_plugin_utils.oom import cuda_oom_to_plugin_resource_error
+
+# Shared HF helpers (cjm-hf-plugin-utils): cache-config mixin + progress download + OOM-typed load.
 from cjm_hf_plugin_utils.cache_config import HFCacheConfig
 from cjm_hf_plugin_utils.download import snapshot_download_with_progress
 from cjm_hf_plugin_utils.loading import load_pretrained_with_oom
@@ -80,7 +73,7 @@ class VoxtralHFPluginConfig(HFCacheConfig):
         metadata={
             SCHEMA_TITLE: "Data Type",
             RELOAD_TRIGGER: "model",  # CR-4: change triggers model reload
-            SCHEMA_DESC: "Data type for model weights (auto will use bfloat16 on GPU, float32 on CPU)",
+            SCHEMA_DESC: "Data type for model weights (auto uses bfloat16; set float32 explicitly for full precision)",
             SCHEMA_ENUM: ["auto", "bfloat16", "float16", "float32"]
         }
     )
@@ -151,11 +144,24 @@ class VoxtralHFPluginConfig(HFCacheConfig):
 
 
 # %% ../nbs/plugin.ipynb #plugin-class
-class VoxtralHFPlugin(TranscriptionPlugin):
-    """Mistral Voxtral transcription plugin via Hugging Face Transformers."""
+class VoxtralHFPlugin(ToolCapability):
+    """Mistral Voxtral transcription plugin via Hugging Face Transformers (stage 8: pure-compute tool capability).
 
+    Native-surface model (PILLAR 1c): this tool is PURE COMPUTE — `transcribe`
+    loads the model, runs inference, and builds the typed `TranscriptionResult`.
+    The cache-check + persistence bookends + the per-call `force` control live in
+    the generic transcription adapter (cjm-transcription-adapter-interface); the
+    result DTO lives in cjm-capability-primitives; identity is derived from the
+    installed distribution. No `get_plugin_metadata`, no `self.storage`."""
+
+    # CR-4: declarative reload-triggers — substrate's reconfigure_with_triggers
+    # walks this config_class's dataclass fields for RELOAD_TRIGGER metadata and
+    # fires the corresponding `_release_<trigger>` method on field changes.
     config_class = VoxtralHFPluginConfig
 
+    # Track 19 (CR-12 worker-env model): worker spawn env declared on the class.
+    # CUDA_VISIBLE_DEVICES + OMP_NUM_THREADS are static; HF_HOME is templated to
+    # the substrate models dir. The substrate resolves + injects at Popen.
     WORKER_ENV: ClassVar[List[EnvVarSpec]] = [
         EnvVarSpec(
             name="CUDA_VISIBLE_DEVICES",
@@ -185,23 +191,23 @@ class VoxtralHFPlugin(TranscriptionPlugin):
         self.processor = None
         self.device = None
         self.dtype = None
-        self.storage: Optional[TranscriptionStorage] = None
 
     @property
     def name(self) -> str: # Plugin name identifier
-        """Get the plugin name identifier."""
-        return get_plugin_metadata()["name"]
+        """Plugin identity, derived from the installed distribution (PILLAR 1c).
+
+        Runtime-derived: in the worker / in-env introspection `__package__`
+        resolves; the manifest records the same value independently (the
+        dual-mode generator reads it from the distribution)."""
+        from importlib.metadata import metadata, packages_distributions
+        dist = (packages_distributions().get(__package__) or [__package__.replace("_", "-")])[0]
+        return metadata(dist)["Name"]
 
     @property
     def version(self) -> str: # Plugin version string
         """Get the plugin version string."""
         from cjm_transcription_plugin_voxtral_hf import __version__
         return __version__
-
-    @property
-    def supported_formats(self) -> List[str]: # List of supported audio formats
-        """Get the list of supported audio file formats."""
-        return ["wav", "mp3", "flac", "m4a", "ogg", "webm", "mp4", "avi", "mov"]
 
     def get_current_config(self) -> Dict[str, Any]: # Current configuration as dictionary
         """Return current configuration state."""
@@ -226,157 +232,103 @@ class VoxtralHFPlugin(TranscriptionPlugin):
         diff-and-reload is replaced by declarative RELOAD_TRIGGER metadata; the
         substrate's reconfigure path fires _release_model then re-applies config."""
         self._apply_config(config)
-        
-        # Initialize standardized storage (one-time)
-        db_path = get_plugin_metadata()["db_path"]
-        self.storage = TranscriptionStorage(db_path)
-        
         self.logger.info(f"Initialized Voxtral HF plugin with model '{self.config.model_id}' on device '{self.device}' with dtype '{self.dtype}'")
 
-    def execute(
+    def transcribe(
         self,
-        audio: Union[str, Path], # Audio data or path to audio file to transcribe
-        **kwargs # Additional arguments to override config
-    ) -> TranscriptionResult: # Transcription result with text and metadata
-        """Transcribe audio using Voxtral."""
-        # Prepare audio file
+        audio: Union[str, Path], # Path to MODEL-READY audio (converted upstream)
+        **kwargs # Provenance (source_start_time/source_end_time) stamped into metadata
+    ) -> TranscriptionResult: # Typed transcription output
+        """Transcribe model-ready audio using Voxtral — PURE COMPUTE.
+
+        Stage 8 / PILLAR 1c: the cache-check + persistence bookends moved to the
+        generic transcription adapter; this method loads the model, runs
+        inference, and builds the typed result. Model params come from
+        `self.config` (the CR-15 per-call override path is gone — the tool runs
+        its effective config, no metadata lie); `source_start_time` /
+        `source_end_time` ride the provenance kwarg channel into metadata."""
+        # Validate + resolve the input path, then load the model.
         audio_path = self._prepare_audio(audio)
-        temp_file_created = False  # caller provides a model-ready path; plugin never creates a temp file
-
-        # Hash the audio file (content) for the cache key
-        audio_hash = hash_file(audio_path)
-
-        # Hash the effective config for cache keying. CR-15: config_hash derives from
-        # self.config (the effective config); the per-call kwargs config-overrides below
-        # are NOT reflected here — that override path predates the substrate overhaul and
-        # is slated for removal (candidate CR-15 / project_execute_invocation_contract_gap).
-        config_hash = hash_dict_canonical(config_to_dict(self.config))
-
-        # 1. Cache check (content-correct: audio_path + audio_hash + config_hash), before
-        #    loading the model so a pure cache hit skips the model load entirely.
-        if not kwargs.get("force", False):
-            cached = self.storage.get_cached(str(audio), audio_hash, config_hash)
-            if cached:
-                self.logger.info(f"Using cached transcription for {audio}")
-                return TranscriptionResult(
-                    text=cached.text,
-                    confidence=None,
-                    segments=cached.segments,
-                    metadata=cached.metadata,
-                )
-
-        # 2. Cache miss — load the model and transcribe
         self._load_model()
 
+        # Effective config (no per-call override path).
+        c = self.config
+        model_id = c.model_id
+        language = c.language
+        max_new_tokens = c.max_new_tokens
+        do_sample = c.do_sample
+        temperature = c.temperature
+        top_p = c.top_p
+
+        # Prepare inputs
+        self.logger.info(f"Processing audio with Voxtral {model_id}")
+
+        inputs = self.processor.apply_transcription_request(
+            language=language or "en",
+            audio=str(audio_path),
+            model_id=model_id
+        )
+        inputs = inputs.to(self.device, dtype=self.dtype)
+
+        # Generation kwargs
+        generation_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+        }
+        # Add sampling parameters if sampling is enabled
+        if do_sample:
+            generation_kwargs["temperature"] = temperature
+            generation_kwargs["top_p"] = top_p
+
+        # Generate transcription. SG-47 Track B wraps the inference site so
+        # CUDA OOM surfaces as PluginResourceError → CR-7 reactive-retry reloads.
         try:
-            # Get config values, allowing kwargs overrides
-            # CR-15: these per-call config-overrides bypass reconfigure/persistence/validation/
-            # config_hash and are slated for removal; provenance kwargs (job_id/source_*_time) stay.
-            model_id = kwargs.get("model_id", self.config.model_id)
-            language = kwargs.get("language", self.config.language)
-            max_new_tokens = kwargs.get("max_new_tokens", self.config.max_new_tokens)
-            do_sample = kwargs.get("do_sample", self.config.do_sample)
-            temperature = kwargs.get("temperature", self.config.temperature)
-            top_p = kwargs.get("top_p", self.config.top_p)
-            
-            # Prepare inputs
-            self.logger.info(f"Processing audio with Voxtral {model_id}")
-            
-            inputs = self.processor.apply_transcription_request(
-                language=language or "en",
-                audio=str(audio_path),
-                model_id=model_id
-            )
-            inputs = inputs.to(self.device, dtype=self.dtype)
-            
-            # Generation kwargs
-            generation_kwargs = {
-                "max_new_tokens": max_new_tokens,
-                "do_sample": do_sample,
+            with torch.no_grad():
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    outputs = self.model.generate(
+                        **inputs,
+                        **generation_kwargs
+                    )
+        except torch.cuda.OutOfMemoryError as e:
+            raise cuda_oom_to_plugin_resource_error(
+                e, label=f"Voxtral inference (model={model_id!r})",
+            ) from e
+
+        # Decode the output
+        result_text = self.processor.batch_decode(
+            outputs[:, inputs.input_ids.shape[1]:],
+            skip_special_tokens=True
+        )[0]
+
+        # Clean up tensors immediately
+        del inputs
+        del outputs
+        if self.device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Capture provenance metadata passed via kwargs
+        provenance_meta = {
+            k: v for k, v in kwargs.items()
+            if k in ['source_start_time', 'source_end_time']
+        }
+
+        # Create transcription result
+        transcription_result = TranscriptionResult(
+            text=result_text.strip(),
+            confidence=None,  # Voxtral doesn't provide confidence scores
+            segments=None,  # Voxtral doesn't provide segments by default
+            metadata={
+                "model": model_id,
+                **provenance_meta,
+                "language": language or "en",
+                "device": self.device,
+                "dtype": str(self.dtype),
             }
-            
-            # Add sampling parameters if sampling is enabled
-            if do_sample:
-                generation_kwargs["temperature"] = temperature
-                generation_kwargs["top_p"] = top_p
-            
-            # Generate transcription. SG-47 Track B wraps the inference site so
-            # CUDA OOM surfaces as PluginResourceError → CR-7 reactive-retry reloads.
-            try:
-                with torch.no_grad():
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        outputs = self.model.generate(
-                            **inputs,
-                            **generation_kwargs
-                        )
-            except torch.cuda.OutOfMemoryError as e:
-                raise cuda_oom_to_plugin_resource_error(
-                    e, label=f"Voxtral inference (model={self.config.model_id!r})",
-                ) from e
-            
-            # Decode the output
-            result_text = self.processor.batch_decode(
-                outputs[:, inputs.input_ids.shape[1]:], 
-                skip_special_tokens=True
-            )[0]
+        )
 
-            # Clean up tensors immediately
-            del inputs
-            del outputs
-            
-            # Clear GPU cache if using CUDA
-            if self.device == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            # Capture provenance metadata passed via kwargs
-            provenance_meta = {
-                k: v for k, v in kwargs.items() 
-                if k in ['source_start_time', 'source_end_time']
-            }
-            
-            # Create transcription result
-            transcription_result = TranscriptionResult(
-                text=result_text.strip(),
-                confidence=None,  # Voxtral doesn't provide confidence scores
-                segments=None,  # Voxtral doesn't provide segments by default
-                metadata={
-                    "model": model_id,
-                    **provenance_meta,
-                    "language": language or "en",
-                    "device": self.device,
-                    "dtype": str(self.dtype),
-                }
-            )
-
-            # Hash the transcription output
-            text_hash = hash_bytes(transcription_result.text.encode())
-
-            # Save to standardized storage (helper logs success/failure; never raises)
-            job_id = kwargs.get("job_id", str(uuid4()))
-            self.storage.save_with_logging(
-                job_id=job_id,
-                audio_path=str(audio),
-                audio_hash=audio_hash,
-                config_hash=config_hash,
-                text=transcription_result.text,
-                text_hash=text_hash,
-                segments=transcription_result.segments,
-                metadata=transcription_result.metadata,
-                logger=self.logger,
-            )
-            
-            self.logger.info(f"Transcription completed: {len(result_text.split())} words")
-            return transcription_result
-            
-        finally:
-            # Clean up temporary file if created
-            if temp_file_created:
-                try:
-                    Path(audio_path).unlink()
-                except Exception:
-                    pass
-
+        self.logger.info(f"Transcription completed: {len(result_text.split())} words")
+        return transcription_result
 
 # %% ../nbs/plugin.ipynb #m-apply-config
 @patch
@@ -396,12 +348,13 @@ def _apply_config(
     else:
         self.device = self.config.device
 
-    # Resolve dtype
+    # Resolve dtype. G9: `auto` resolves to bfloat16 UNIFORMLY (device-independent).
+    # The prior auto->float32-on-CPU default doubled the CPU footprint — stage-3 G9:
+    # Voxtral-Small-24B with auto on CPU hit ~83GB RSS + swap and was unusable, while
+    # explicit bfloat16 on CPU ran fine. Full precision stays available via an
+    # explicit dtype="float32".
     if self.config.dtype == "auto":
-        if self.device == "cuda":
-            self.dtype = torch.bfloat16
-        else:
-            self.dtype = torch.float32
+        self.dtype = torch.bfloat16
     else:
         dtype_map = {
             "bfloat16": torch.bfloat16,
@@ -409,7 +362,6 @@ def _apply_config(
             "float32": torch.float32
         }
         self.dtype = dtype_map[self.config.dtype]
-
 
 # %% ../nbs/plugin.ipynb #m-release-model
 @patch
@@ -460,12 +412,19 @@ def _load_model(self:VoxtralHFPlugin) -> None:
         with self.heartbeat(f"loading Voxtral model {self.config.model_id}"):
             # Download (honors air-gap via local_files_only). The heartbeat is the
             # floor here; the tqdm hook adds real "downloading <file>" % when it fires.
+            # G6: skip the Mistral original-format `consolidated.safetensors` — on
+            # Voxtral-Small-24B it is a 48.5GB second full copy of the weights (Mini
+            # ships an 8.75GB one) that HF `from_pretrained` never loads (it reads the
+            # sharded `model-*.safetensors` via `model.safetensors.index.json`). The
+            # `ignore_patterns` rides snapshot_download's **kwargs passthrough (no
+            # shared-util change) and no-ops on repos without a consolidated copy.
             snapshot_download_with_progress(
                 self.config.model_id,
                 report_progress=self.report_progress,
                 cache_dir=self.config.cache_dir,
                 revision=self.config.revision,
                 local_files_only=self.config.local_files_only,
+                ignore_patterns=["consolidated*"],
             )
             self.processor = AutoProcessor.from_pretrained(
                 self.config.model_id,
@@ -494,7 +453,6 @@ def _load_model(self:VoxtralHFPlugin) -> None:
         ) from e
     except Exception as e:
         raise PluginFatalError(f"Failed to load Voxtral model: {e}") from e
-
 
 # %% ../nbs/plugin.ipynb #m-prepare-audio
 @patch
@@ -543,144 +501,3 @@ def cleanup(self:VoxtralHFPlugin) -> None:
     """Release the model + processor (CR-4: delegates to `_release_model`)."""
     self._release_model()
 
-
-# %% ../nbs/plugin.ipynb #4f195e29
-@patch
-def supports_streaming(
-    self:VoxtralHFPlugin
-) -> bool:  # True if streaming is supported
-    """Check if this plugin supports streaming transcription."""
-    return True
-
-@patch
-def execute_stream(
-    self:VoxtralHFPlugin,
-    audio: Union[str, Path],  # Audio data or path to audio file
-    **kwargs  # Additional plugin-specific parameters
-) -> Generator[str, None, TranscriptionResult]:  # Yields text chunks, returns final result
-    """Stream transcription results chunk by chunk."""
-    # Load model if not already loaded
-    self._load_model()
-    
-    # Prepare audio file
-    audio_path = self._prepare_audio(audio)
-    temp_file_created = False  # caller provides a model-ready path; plugin never creates a temp file
-    
-    try:
-        # Get config values, allowing kwargs overrides
-        model_id = kwargs.get("model_id", self.config.model_id)
-        language = kwargs.get("language", self.config.language)
-        max_new_tokens = kwargs.get("max_new_tokens", self.config.max_new_tokens)
-        do_sample = kwargs.get("do_sample", self.config.do_sample)
-        temperature = kwargs.get("temperature", self.config.temperature)
-        top_p = kwargs.get("top_p", self.config.top_p)
-        
-        # Prepare inputs
-        self.logger.info(f"Streaming transcription with Voxtral {model_id}")
-        
-        inputs = self.processor.apply_transcription_request(
-            language=language or "en",
-            audio=str(audio_path),
-            model_id=model_id
-        )
-        inputs = inputs.to(self.device, dtype=self.dtype)
-        
-        # Create streamer
-        from transformers import TextIteratorStreamer
-        streamer = TextIteratorStreamer(
-            self.processor.tokenizer, 
-            skip_prompt=True, 
-            skip_special_tokens=True
-        )
-        
-        # Generation kwargs
-        generation_kwargs = {
-            **inputs,
-            "max_new_tokens": max_new_tokens,
-            "do_sample": do_sample,
-            "streamer": streamer,
-        }
-        
-        # Add sampling parameters if sampling is enabled
-        if do_sample:
-            generation_kwargs["temperature"] = temperature
-            generation_kwargs["top_p"] = top_p
-        
-        # Start generation in a separate thread with torch.no_grad().
-        # SG-47 Track B follow-up: thread target wraps the generate() call so
-        # CUDA OOMs (and other exceptions) raised inside the thread propagate
-        # back to the generator caller as typed PluginResourceError. The mutable
-        # `generation_exception` list is the cross-thread propagation channel
-        # — single-element capture is sufficient because we only re-raise once.
-        generation_exception: List[BaseException] = []
-
-        def generate_with_no_grad():
-            try:
-                with torch.no_grad():
-                    self.model.generate(**generation_kwargs)
-            except BaseException as e:
-                # Capture for cross-thread propagation; re-raise so the thread
-                # still terminates normally and HuggingFace's TextIteratorStreamer
-                # gets its end-signal via the generate() finally block (the streamer
-                # signals StopIteration to the consuming for-loop on end).
-                generation_exception.append(e)
-                raise
-
-        thread = Thread(target=generate_with_no_grad)
-        thread.start()
-
-        # Collect generated text. If the thread crashes, HF's streamer signals
-        # end (StopIteration) when generate's finally fires; the for-loop
-        # terminates without yielding further chunks, and the post-iteration
-        # exception check below re-raises the captured exception.
-        generated_text = ""
-        for text_chunk in streamer:
-            generated_text += text_chunk
-            yield text_chunk
-
-        # Wait for generation to complete (bounded — generation should be done
-        # by the time the streamer's iteration ended; this is mostly to flush
-        # the captured exception state).
-        thread.join(timeout=30.0)
-
-        # SG-47 Track B follow-up: re-raise any thread-captured exception with
-        # typed classification. CUDA OOMs map to PluginResourceError + populated
-        # ResourceShortfall so CR-7's reactive-retry path can reload + retry.
-        if generation_exception:
-            exc = generation_exception[0]
-            if isinstance(exc, torch.cuda.OutOfMemoryError):
-                raise cuda_oom_to_plugin_resource_error(
-                    exc, label=f"Voxtral streaming inference (model={model_id!r})",
-                ) from exc
-            # Non-OOM thread exception: re-raise as-is so the substrate's default
-            # classify_exception() MRO walk classifies it via CR-5.
-            raise exc
-
-        # Clean up tensors immediately
-        del inputs
-        
-        # Clear GPU cache if using CUDA
-        if self.device == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        # Return final result
-        return TranscriptionResult(
-            text=generated_text.strip(),
-            confidence=None,
-            segments=None,
-            metadata={
-                "model": model_id,
-                "language": language or "en",
-                "device": self.device,
-                "dtype": str(self.dtype),
-                "streaming": True,
-            }
-        )
-        
-    finally:
-        # Clean up temporary file if created
-        if temp_file_created:
-            try:
-                Path(audio_path).unlink()
-            except Exception:
-                pass
