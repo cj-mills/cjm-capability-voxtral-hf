@@ -12,22 +12,18 @@ pip install cjm_transcription_plugin_voxtral_hf
 ## Project Structure
 
     nbs/
-    ├── meta.ipynb   # Metadata introspection for the Voxtral HF plugin used by cjm-ctl to generate the registration manifest.
     └── plugin.ipynb # Plugin implementation for Mistral Voxtral transcription through Hugging Face Transformers
 
-Total: 2 notebooks
+Total: 1 notebook
 
 ## Module Dependencies
 
 ``` mermaid
 graph LR
-    meta["meta<br/>Metadata"]
     plugin["plugin<br/>Voxtral HF Plugin"]
-
-    plugin --> meta
 ```
 
-*1 cross-module dependencies detected*
+No cross-module dependencies detected.
 
 ## CLI Reference
 
@@ -36,36 +32,6 @@ No CLI commands found in this project.
 ## Module Overview
 
 Detailed documentation for each module in the project:
-
-### Metadata (`meta.ipynb`)
-
-> Metadata introspection for the Voxtral HF plugin used by cjm-ctl to
-> generate the registration manifest.
-
-#### Import
-
-``` python
-from cjm_transcription_plugin_voxtral_hf.meta import (
-    get_plugin_metadata
-)
-```
-
-#### Functions
-
-``` python
-def get_plugin_metadata() -> Dict[str, Any]: # Plugin metadata for manifest generation
-    """Return metadata required to register this plugin with the PluginManager."""
-    # Fallback base path (current behavior for backward compatibility)
-    base_path = os.path.dirname(os.path.dirname(sys.executable))
-    
-    # Use CJM config if available, else fallback to env-relative paths
-    cjm_data_dir = os.environ.get("CJM_DATA_DIR")
-    
-    # Plugin data directory
-    plugin_name = "cjm-transcription-plugin-voxtral-hf"
-    if cjm_data_dir
-    "Return metadata required to register this plugin with the PluginManager."
-```
 
 ### Voxtral HF Plugin (`plugin.ipynb`)
 
@@ -179,24 +145,6 @@ def cleanup(self:VoxtralHFPlugin) -> None
     "Release the model + processor (CR-4: delegates to `_release_model`)."
 ```
 
-``` python
-@patch
-def supports_streaming(
-    self:VoxtralHFPlugin
-) -> bool:  # True if streaming is supported
-    "Check if this plugin supports streaming transcription."
-```
-
-``` python
-@patch
-def execute_stream(
-    self:VoxtralHFPlugin,
-    audio: Union[str, Path],  # Audio data or path to audio file
-    **kwargs  # Additional plugin-specific parameters
-) -> Generator[str, None, TranscriptionResult]:  # Yields text chunks, returns final result
-    "Stream transcription results chunk by chunk."
-```
-
 #### Classes
 
 ``` python
@@ -223,7 +171,16 @@ class VoxtralHFPlugin:
         """Initialize the Voxtral HF plugin with default configuration."""
         self.logger = logging.getLogger(f"{__name__}.{type(self).__name__}")
         self.config: VoxtralHFPluginConfig = None
-    "Mistral Voxtral transcription plugin via Hugging Face Transformers."
+    """
+    Mistral Voxtral transcription plugin via Hugging Face Transformers (stage 8: pure-compute tool capability).
+    
+    Native-surface model (PILLAR 1c): this tool is PURE COMPUTE — `transcribe`
+    loads the model, runs inference, and builds the typed `TranscriptionResult`.
+    The cache-check + persistence bookends + the per-call `force` control live in
+    the generic transcription adapter (cjm-transcription-adapter-interface); the
+    result DTO lives in cjm-capability-primitives; identity is derived from the
+    installed distribution. No `get_plugin_metadata`, no `self.storage`.
+    """
     
     def __init__(self):
             """Initialize the Voxtral HF plugin with default configuration."""
@@ -232,28 +189,30 @@ class VoxtralHFPlugin:
         "Initialize the Voxtral HF plugin with default configuration."
     
     def name(self) -> str: # Plugin name identifier
-            """Get the plugin name identifier."""
-            return "voxtral_hf"
+            """Plugin identity, derived from the installed distribution (PILLAR 1c).
+    
+            Runtime-derived: in the worker / in-env introspection `__package__`
+            resolves; the manifest records the same value independently (the
+            dual-mode generator reads it from the distribution)."""
+            from importlib.metadata import metadata, packages_distributions
+            dist = (packages_distributions().get(__package__) or [__package__.replace("_", "-")])[0]
+            return metadata(dist)["Name"]
     
         @property
         def version(self) -> str: # Plugin version string
-        "Get the plugin name identifier."
+        "Plugin identity, derived from the installed distribution (PILLAR 1c).
+
+Runtime-derived: in the worker / in-env introspection `__package__`
+resolves; the manifest records the same value independently (the
+dual-mode generator reads it from the distribution)."
     
     def version(self) -> str: # Plugin version string
             """Get the plugin version string."""
             from cjm_transcription_plugin_voxtral_hf import __version__
             return __version__
     
-        @property
-        def supported_formats(self) -> List[str]: # List of supported audio formats
-        "Get the plugin version string."
-    
-    def supported_formats(self) -> List[str]: # List of supported audio formats
-            """Get the list of supported audio file formats."""
-            return ["wav", "mp3", "flac", "m4a", "ogg", "webm", "mp4", "avi", "mov"]
-    
         def get_current_config(self) -> Dict[str, Any]: # Current configuration as dictionary
-        "Get the list of supported audio file formats."
+        "Get the plugin version string."
     
     def get_current_config(self) -> Dict[str, Any]: # Current configuration as dictionary
             """Return current configuration state."""
@@ -286,10 +245,17 @@ class VoxtralHFPlugin:
 diff-and-reload is replaced by declarative RELOAD_TRIGGER metadata; the
 substrate's reconfigure path fires _release_model then re-applies config."
     
-    def execute(
+    def transcribe(
             self,
-            audio: Union[str, Path], # Audio data or path to audio file to transcribe
-            **kwargs # Additional arguments to override config
-        ) -> TranscriptionResult: # Transcription result with text and metadata
-        "Transcribe audio using Voxtral."
+            audio: Union[str, Path], # Path to MODEL-READY audio (converted upstream)
+            **kwargs # Provenance (source_start_time/source_end_time) stamped into metadata
+        ) -> TranscriptionResult: # Typed transcription output
+        "Transcribe model-ready audio using Voxtral — PURE COMPUTE.
+
+Stage 8 / PILLAR 1c: the cache-check + persistence bookends moved to the
+generic transcription adapter; this method loads the model, runs
+inference, and builds the typed result. Model params come from
+`self.config` (the CR-15 per-call override path is gone — the tool runs
+its effective config, no metadata lie); `source_start_time` /
+`source_end_time` ride the provenance kwarg channel into metadata."
 ```
