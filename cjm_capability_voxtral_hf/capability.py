@@ -28,6 +28,8 @@ from cjm_substrate_hf_utils.loading import load_pretrained_with_oom
 from cjm_substrate_torch_utils.memory import release_model
 from cjm_substrate_torch_utils.oom import cuda_oom_to_capability_resource_error, is_cuda_oom
 
+from cjm_capability_voxtral_hf.degenerate import truncate_degenerate_tail
+
 try:
     from transformers import VoxtralForConditionalGeneration, AutoProcessor
     VOXTRAL_AVAILABLE = True
@@ -104,6 +106,20 @@ class VoxtralHFCapabilityConfig(HFCacheConfig):
             SCHEMA_DESC: "Top-p (nucleus) sampling parameter (only used when do_sample=true)",
             SCHEMA_MIN: 0.0,
             SCHEMA_MAX: 1.0
+        }
+    )
+    degenerate_min_repeats:int = field(
+        # Runaway guard (finding 84f466bb): voxtral-mini locks into repeating one
+        # short phrase to the token cap on some lecture chunks ('some' × 24790);
+        # sampling changes the phrase, not the loop. A phrase of up to six words
+        # repeated this many times back to back is cut at its onset (one instance
+        # kept, the prefix verbatim) and the result's metadata carries the marker.
+        default=8,
+        metadata={
+            SCHEMA_TITLE: "Degenerate Repeat Threshold",
+            SCHEMA_DESC: "Consecutive repeats of one short phrase (up to 6 words) that mark a runaway loop; the text is truncated at the loop onset and metadata.degenerate_tail records it. 0 disables the guard",
+            SCHEMA_MIN: 0,
+            SCHEMA_MAX: 1000
         }
     )
     compile_model:bool = field(
@@ -370,9 +386,23 @@ class VoxtralHFCapability(ToolCapability):
             if k in ['source_start_time', 'source_end_time']
         }
 
+        # Runaway guard (finding 84f466bb): cut a degenerate repetition tail at
+        # its onset, keep the prefix verbatim + one instance of the phrase, and
+        # carry the marker in metadata — the good text before the loop survives
+        # and downstream (forced alignment) never sees the runaway text.
+        guarded = truncate_degenerate_tail(result_text.strip(),
+                                           min_repeats=c.degenerate_min_repeats)
+        result_text = guarded["text"]
+        degenerate_tail = guarded["degenerate_tail"]
+        if degenerate_tail is not None:
+            self.logger.warning(
+                f"Degenerate tail cut: {degenerate_tail['phrase']!r} × "
+                f"{degenerate_tail['repeats']} from word {degenerate_tail['onset_word']} "
+                f"({degenerate_tail['words_before']} -> {degenerate_tail['words_after']} words)")
+
         # Create transcription result
         transcription_result = TranscriptionResult(
-            text=result_text.strip(),
+            text=result_text,
             confidence=None,  # Voxtral doesn't provide confidence scores
             segments=None,  # Voxtral doesn't provide segments by default
             metadata={
@@ -383,6 +413,7 @@ class VoxtralHFCapability(ToolCapability):
                 "dtype": str(self.dtype),
                 "prompt_mode": c.prompt_mode,
                 **({"instruct_prompt": c.instruct_prompt} if c.prompt_mode == "instruct" else {}),
+                **({"degenerate_tail": degenerate_tail} if degenerate_tail is not None else {}),
             }
         )
 
