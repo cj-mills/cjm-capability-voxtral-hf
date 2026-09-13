@@ -16,6 +16,7 @@ from typing import Any, ClassVar, Dict, List, Optional, Union
 
 import torch
 from cjm_capability_primitives.transcription import TranscriptionResult
+from cjm_capability_voxtral_hf.degenerate import truncate_degenerate_tail
 from cjm_substrate.core.capability import EnvVarSpec, RELOAD_TRIGGER, ToolCapability
 from cjm_substrate.core.errors import (CapabilityFatalError, CapabilityInputError,
                                        CapabilityResourceError)
@@ -27,8 +28,6 @@ from cjm_substrate_hf_utils.download import snapshot_download_with_progress
 from cjm_substrate_hf_utils.loading import load_pretrained_with_oom
 from cjm_substrate_torch_utils.memory import release_model
 from cjm_substrate_torch_utils.oom import cuda_oom_to_capability_resource_error, is_cuda_oom
-
-from cjm_capability_voxtral_hf.degenerate import truncate_degenerate_tail
 
 try:
     from transformers import VoxtralForConditionalGeneration, AutoProcessor
