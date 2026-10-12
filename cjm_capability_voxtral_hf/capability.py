@@ -39,6 +39,7 @@ except ImportError:
 @dataclass
 class VoxtralHFCapabilityConfig(HFCacheConfig):
     """Configuration for Voxtral HF transcription capability."""
+
     model_id:str = field(
         default="mistralai/Voxtral-Mini-3B-2507",
         metadata={
