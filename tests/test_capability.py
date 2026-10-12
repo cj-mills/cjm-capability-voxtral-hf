@@ -3,14 +3,13 @@
 Projected from the capability notebook's test cells at the c25780e8 flip
 (hermetic: initialize is lazy config-apply, no model download; the transcribe
 path is exercised by the e2e harnesses)."""
+
 from dataclasses import fields
 
 import pytest
-
-from cjm_capability_voxtral_hf.capability import (VoxtralHFCapability,
-                                                  VoxtralHFCapabilityConfig)
+from cjm_capability_voxtral_hf.capability import VoxtralHFCapability, VoxtralHFCapabilityConfig
 from cjm_substrate.core.capability import ToolCapability
-from cjm_substrate.utils.validation import SCHEMA_ENUM, dict_to_config
+from cjm_substrate.utils.validation import dict_to_config, SCHEMA_ENUM
 
 
 def test_pure_compute_surface():

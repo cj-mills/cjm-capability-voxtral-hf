@@ -1,7 +1,7 @@
 """Tests for cjm_capability_voxtral_hf.degenerate — the runaway-repetition guard
 (finding 84f466bb). Pure functions: no torch, no model."""
-from cjm_capability_voxtral_hf.degenerate import (find_degenerate_onset,
-                                                  truncate_degenerate_tail)
+
+from cjm_capability_voxtral_hf.degenerate import find_degenerate_onset, truncate_degenerate_tail
 
 
 def test_single_word_runaway_is_cut_at_onset_keeping_one_instance():
